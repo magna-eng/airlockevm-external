@@ -1,4 +1,4 @@
-pragma solidity =0.8.24 ^0.8.20 ^0.8.4;
+pragma solidity ^0.8.20 ^0.8.24 ^0.8.4;
 
 // evm/lib/openzeppelin-contracts/contracts/access/IAccessControl.sol
 
@@ -2176,7 +2176,7 @@ abstract contract ERC165 is IERC165 {
     }
 }
 
-// evm/src/distribution/V2/2.1.0/src/interfaces/ICalendarVester.sol
+// evm/src/distribution/src/interfaces/ICalendarVester.sol
 
 /// @notice Abstract contract to define common behavior for Calender type vesters, specifically to calculate the vested amount
 abstract contract CalendarVester {
@@ -2184,7 +2184,7 @@ abstract contract CalendarVester {
      * @notice Get the vested amount for Calendar type vesters
      *
      * @param _unlockTimestamps array of unlock timestamps
-     * @param _unlockPercents array of unlock percents
+     * @param _unlockAmounts array of unlock amounts
      * @param _totalAllocation total amount of tokens to be vested
      * @param _terminatedTimestamp the time when the allocation was terminated
      *
@@ -2192,11 +2192,11 @@ abstract contract CalendarVester {
      */
     function _getVestedAmount(
         uint32[] memory _unlockTimestamps,
-        uint256[] memory _unlockPercents,
+        uint256[] memory _unlockAmounts,
         uint256 _totalAllocation,
         uint256 _terminatedTimestamp
     ) internal view returns (uint256) {
-        uint256 percent;
+        uint256 amount;
         uint32 blockTimestamp = uint32(block.timestamp);
 
         uint256 finalTimestamp;
@@ -2210,11 +2210,11 @@ abstract contract CalendarVester {
             if (_unlockTimestamps[i] > finalTimestamp) {
                 break;
             }
-            percent += _unlockPercents[i];
+            amount += _unlockAmounts[i];
         }
 
-        // Perecent is in 10,000ths, so for precision we need to multipy then divide
-        return Math.min(_totalAllocation, Math.mulDiv(_totalAllocation, percent, 10_000 * 100));
+        // staying on the safe side in the unlikely case that the amounts added up is higher than the _totalAllocation
+        return Math.min(_totalAllocation, amount);
     }
 }
 
@@ -2252,7 +2252,10 @@ abstract contract Multicall is Context {
     }
 }
 
-// evm/src/distribution/V2/2.1.0/src/interfaces/IPostClaimHandler.sol
+// evm/src/distribution/src/interfaces/IPostClaimHandler.sol
+
+/// @dev the address for denoting whether direct claims are allowed
+IPostClaimHandler constant DIRECT_CLAIM_HANDLER = IPostClaimHandler(address(0));
 
 /// @notice Interface for post claim handlers
 interface IPostClaimHandler {
@@ -2266,6 +2269,7 @@ interface IPostClaimHandler {
      * @param amount The amount of vesting tokens that were claimed and transferred to this contract address.
      * @param originalBeneficiary The address of the user who was the original owner of the vesting tokens at the time the vesting contract was created.
      * @param withdrawalAddress The latest owner of the vesting tokens which might be the same as the 'originalBeneficiary' in case no ownership transfer took place.
+     * @param allocationId The allocation id from which the withdrawn amount was taken.
      * @param extraData Any abi encoded extra data that is necessary for the custom action. For example in case of a custom staking action, the user could state his
      *                  staking preference by providing extraData.
      */
@@ -2274,6 +2278,7 @@ interface IPostClaimHandler {
         uint256 amount,
         address originalBeneficiary,
         address withdrawalAddress,
+        string memory allocationId,
         bytes memory extraData
     ) external;
 }
@@ -2597,7 +2602,7 @@ abstract contract AccessControl is Context, IAccessControl, ERC165 {
     }
 }
 
-// evm/src/distribution/V2/2.1.0/src/interfaces/AirlockTypes.sol
+// evm/src/distribution/src/interfaces/AirlockTypes.sol
 
 /// @dev error thrown when token address is 0
 error ZeroToken();
@@ -2737,12 +2742,12 @@ struct Allocation {
  *
  * @param unlockScheduleId id of the allocation
  * @param unlockTimestamps sequence of timestamps when funds will unlock
- * @param unlockPercents sequence of percents that unlock at each timestamp, in 10,000ths
+ * @param unlockAmounts sequence of amounts that unlock at each timestamp
  */
 struct CalendarUnlockSchedule {
     string unlockScheduleId; // Workaround for Internal or recursive type is not allowed for public state variables
     uint32[] unlockTimestamps;
-    uint256[] unlockPercents;
+    uint256[] unlockAmounts;
 }
 
 /**
@@ -2762,15 +2767,15 @@ struct IntervalUnlockSchedule {
  * @dev solidity does not support immutablability outside of compile time, contracts must not implement mutability
  *
  * @param startDate start timestamp of the piece
- * @param periodLength time length of the piece
- * @param numberOfPeriods how many periods for this piece
- * @param percent the total percent, in 10,000ths that will unlock over the piece
+ * @param periodLength the length of each period in seconds
+ * @param numberOfPeriods the number of periods in the piece
+ * @param amount the amount of tokens that is released in each piece
  */
 struct Piece {
     uint32 startDate;
     uint32 periodLength;
     uint32 numberOfPeriods;
-    uint32 percent;
+    uint256 amount;
 }
 
 /// @notice Holding allocation data for Calendar style vesting, including both immutable and mutable data and a reference to the calendar schedule
@@ -2789,7 +2794,7 @@ struct IntervalAllocation {
     DistributionState distributionState;
 }
 
-// evm/src/distribution/V2/2.1.0/src/MerkleValidator.sol
+// evm/src/distribution/src/MerkleValidator.sol
 
 /// @notice Utility contract to verify that a leaf is included in the Merkle tree
 contract MerkleValidator {
@@ -2808,7 +2813,7 @@ contract MerkleValidator {
     }
 }
 
-// evm/src/distribution/V2/2.1.0/src/interfaces/IAirlockBase.sol
+// evm/src/distribution/src/interfaces/IAirlockBase.sol
 
 /**
  * @title Defines the common errors, structures, and functions for managing vesting and related actions.
@@ -2841,25 +2846,25 @@ abstract contract IAirlockBase is AccessControl, ReentrancyGuard {
     bytes32 public constant BENEFACTOR = keccak256("BENEFACTOR");
     /// @dev the role for managing post claim handlers
     bytes32 public constant POST_CLAIM_HANDLER_MANAGER = keccak256("POST_CLAIM_HANDLER_MANAGER");
-    /// @dev the address for denoting whether direct claims are allowed
-    address public constant DIRECT_CLAIM_ALLOWED = address(0);
 
     /**
      * @notice Constructor to create an IAirlockBase contract
      *
      * @param _token token address this vesting contract will distribute
      * @param _benefactor inital administator and benefactor of the contract
-     * @param _directClaimAllowed true if _token can be directly sent to a user, false if _token can only be sent to an integration contract
+     * @param _postClaimHandlers an array of post claim handlers to be whitelisted
      */
-    constructor(address _token, address _benefactor, bool _directClaimAllowed) {
+    constructor(address _token, address _benefactor, IPostClaimHandler[] memory _postClaimHandlers) {
         if (_token == address(0)) revert ZeroToken();
         if (_benefactor == address(0)) revert ZeroBeneficiary();
         token = _token;
         _grantRole(DEFAULT_ADMIN_ROLE, _benefactor); // The benefactor specified in the deploy can grant and revoke benefactor roles using the AccessControl interface
         _grantRole(BENEFACTOR, _benefactor);
         _grantRole(POST_CLAIM_HANDLER_MANAGER, _benefactor);
-        if (_directClaimAllowed) {
-            postClaimHandlerWhitelist.add(DIRECT_CLAIM_ALLOWED);
+
+        uint256 _postCLaimHandlersLength = _postClaimHandlers.length;
+        for (uint256 i; i < _postCLaimHandlersLength; ++i) {
+            postClaimHandlerWhitelist.add(address(_postClaimHandlers[i]));
         }
     }
 
@@ -2961,9 +2966,9 @@ abstract contract IAirlockBase is AccessControl, ReentrancyGuard {
         if (!postClaimHandlerWhitelist.contains(address(postClaimHandler))) {
             revert PostClaimHandlerNotWhitelisted();
         }
-        // If post claim handler is set to 0, it means the claim token has to be directly transferred to the beneficiary
+        // If post claim handler is set to DIRECT_CLAIM_HANDLER, it means the claim token has to be directly transferred to the beneficiary
         // without any interaction with an integration contract.
-        if (address(postClaimHandler) == address(0)) {
+        if (postClaimHandler == DIRECT_CLAIM_HANDLER) {
             SafeERC20.safeTransfer(IERC20(token), withdrawalAddress, withdrawableAmount);
         } else {
             // Claim tokens have to be forwarded to an integration contract.
@@ -2971,7 +2976,12 @@ abstract contract IAirlockBase is AccessControl, ReentrancyGuard {
 
             // any error in the postClam handler will revert the entire transaction including the transfer above
             postClaimHandler.handlePostClaim(
-                IERC20(token), withdrawableAmount, allocation.originalBeneficiary, withdrawalAddress, extraData
+                IERC20(token),
+                withdrawableAmount,
+                allocation.originalBeneficiary,
+                withdrawalAddress,
+                allocation.id,
+                extraData
             );
         }
     }
@@ -3035,7 +3045,7 @@ abstract contract IAirlockBase is AccessControl, ReentrancyGuard {
     }
 }
 
-// evm/src/distribution/V2/2.1.0/src/IMerkleVester.sol
+// evm/src/distribution/src/IMerkleVester.sol
 
 /// @notice Abstract contract to define common behavior for Merkle type vesters
 interface IMerkleVester {
@@ -3208,7 +3218,7 @@ interface IMerkleVester {
     function revokeAll() external;
 }
 
-// evm/src/distribution/V2/2.1.0/src/interfaces/IIntervalVester.sol
+// evm/src/distribution/src/interfaces/IIntervalVester.sol
 
 /// @notice Abstract contract to define common behavior for Interval type vesters, specifically to calculate the vested amount
 abstract contract IntervalVester is IAirlockBase {
@@ -3217,7 +3227,7 @@ abstract contract IntervalVester is IAirlockBase {
      * @dev iterates over the pieces and calculates the number of tokens that have vested
      *
      * @param interval the interval data for which to calculate vested amount
-     * @param schedule the unlock schedule for which to calculate vested amount
+     * @param schedule the unlock schedule for which to calculate vested amount, pieces can overlap see details below
      *
      * @return amount of tokens vested
      */
@@ -3230,23 +3240,21 @@ abstract contract IntervalVester is IAirlockBase {
 
         uint256 vestingEndTimestamp = _getPieceEndTime(schedule.pieces[schedule.pieces.length - 1]);
 
-        // Ensure full distribution without any rounding if we are past the end of the vesting schedule
-        if (finalTimestamp >= vestingEndTimestamp) return interval.allocation.totalAllocation;
-
-        // brute force iterate over schedule components
         uint256 currVested;
 
+        // 1. pieces can overlap, but they must be ordered ascending by their end time (calculated by _getPieceEndTime)
+        // 2. could quit the loop early if blockTimestamp < startDate for the current piece AND all other previous pieces have passed their end time
         for (uint256 index; index < schedule.pieces.length; index++) {
             currVested += _componentVested(
                 schedule.pieces[index].startDate,
                 schedule.pieces[index].periodLength,
                 schedule.pieces[index].numberOfPeriods,
-                schedule.pieces[index].percent,
-                finalTimestamp,
-                interval.allocation.totalAllocation
+                schedule.pieces[index].amount,
+                finalTimestamp
             );
         }
 
+        // staying on the safe side in the unlikely case that the amounts added up is higher than the _totalAllocation
         return Math.min(interval.allocation.totalAllocation, currVested);
     }
 
@@ -3265,10 +3273,10 @@ abstract contract IntervalVester is IAirlockBase {
      * @notice Gets the vested amount of tokens for a schedule
      * @dev calculates the number of tokens that have vested for a single component
      *
-     * @param startDate the start date of the component
-     * @param periodLength the length of each period
-     * @param numberOfPeriods the number of periods in the component
-     * @param percent the percent of tokens that is released in the component
+     * @param startDate the start timestamp of the piece
+     * @param periodLength the length of each period in seconds
+     * @param numberOfPeriods the number of periods in the piece
+     * @param amount the amount of tokens that is released in each piece
      * @param blockTimestamp the current block timestamp
      *
      * @return amount of tokens vested
@@ -3278,9 +3286,8 @@ abstract contract IntervalVester is IAirlockBase {
         uint256 startDate,
         uint256 periodLength,
         uint256 numberOfPeriods,
-        uint256 percent,
-        uint256 blockTimestamp,
-        uint256 totalAllocation
+        uint256 amount,
+        uint256 blockTimestamp
     ) internal pure returns (uint256) {
         if (blockTimestamp < startDate) {
             return 0;
@@ -3292,8 +3299,7 @@ abstract contract IntervalVester is IAirlockBase {
             fullyVestedPeriods = numberOfPeriods;
         }
 
-        uint256 amount = Math.mulDiv(totalAllocation, percent, 10_000 * 100);
-
+        // rounding issues will be accounted for when fullyVestedPeriods = numberOfPeriods
         return (amount * fullyVestedPeriods) / numberOfPeriods;
     }
 
@@ -3314,20 +3320,23 @@ abstract contract IntervalVester is IAirlockBase {
     }
 }
 
-// evm/src/distribution/V2/2.1.0/src/MerkleVester.sol
+// evm/src/distribution/src/MerkleVester.sol
 
 /**
  * @notice Vesting contract that uses merkle trees to scale to millions of allocations
  */
 contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVester, MerkleValidator, Multicall {
-    /// @notice maximum amount of claim fee in ether
-    uint256 constant MAX_CLAIM_FEE = 0.05 ether;
+    /// @dev maximum amount of claim fee in wei
+    uint256 immutable maxClaimFee;
+
+    /// @dev true, if claim fee should only be payed for the first claim of an allocation, false otherwise
+    bool immutable shouldPayClaimFeeOnlyOnce;
+
+    /// @dev mapping allocation id to a boolean to store allocation ids for which fee was already payed
+    mapping(string => bool) private feeAlreadyPayed;
 
     /// @dev version number of the vester contract
     string public constant version = "dist_v2.1.2";
-    /**
-     * ---------- STATE ----------
-     */
 
     /**
      * @dev lazily store the mutable state as allocaitons are interacted with
@@ -3361,7 +3370,9 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
      * @param _claimFee claim fee in wei
      * @param _feeCollector address where the fees will be transferred
      * @param _feeSetter  address who can update the fee
-     * @param _directClaimAllowed true if _token can be directly sent to a user, false if _token can only be sent to an integration contract
+     * @param _postClaimHandlers an array of post claim handlers to be whitelisted
+     * @param _maxClaimFee the maximum claim fee
+     * @param _shouldPayClaimFeeOnlyOnce true, if claim fee should only be payed for the first claim of an allocation, false otherwise
      */
     constructor(
         address token,
@@ -3369,10 +3380,14 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
         uint256 _claimFee,
         address _feeCollector,
         address _feeSetter,
-        bool _directClaimAllowed
-    ) IAirlockBase(token, benefactor, _directClaimAllowed) {
-        if (_claimFee > MAX_CLAIM_FEE) revert ClaimFeeExceedsMaximum();
+        IPostClaimHandler[] memory _postClaimHandlers,
+        uint256 _maxClaimFee,
+        bool _shouldPayClaimFeeOnlyOnce
+    ) IAirlockBase(token, benefactor, _postClaimHandlers) {
+        if (_claimFee > _maxClaimFee) revert ClaimFeeExceedsMaximum();
         claimFee = _claimFee;
+        maxClaimFee = _maxClaimFee;
+        shouldPayClaimFeeOnlyOnce = _shouldPayClaimFeeOnlyOnce;
 
         if (_feeCollector == address(0)) {
             if (_feeSetter != address(0)) revert InvalidFeeSetter();
@@ -3410,11 +3425,8 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
         view
         returns (CalendarAllocation memory, CalendarUnlockSchedule memory)
     {
-        (
-            string memory allocationType,
-            Allocation memory allocation,
-            CalendarUnlockSchedule memory calendarUnlockSchedule
-        ) = abi.decode(decodableArgs, (string, Allocation, CalendarUnlockSchedule));
+        (, Allocation memory allocation, CalendarUnlockSchedule memory calendarUnlockSchedule) =
+            abi.decode(decodableArgs, (string, Allocation, CalendarUnlockSchedule));
         this.validateLeaf(merkleRoots[rootIndex], decodableArgs, proof);
 
         DistributionState memory distributionState = schedules[allocation.id];
@@ -3431,11 +3443,8 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
         view
         returns (IntervalAllocation memory, IntervalUnlockSchedule memory)
     {
-        (
-            string memory allocationType,
-            Allocation memory allocation,
-            IntervalUnlockSchedule memory intervalUnlockSchedule
-        ) = abi.decode(decodableArgs, (string, Allocation, IntervalUnlockSchedule));
+        (, Allocation memory allocation, IntervalUnlockSchedule memory intervalUnlockSchedule) =
+            abi.decode(decodableArgs, (string, Allocation, IntervalUnlockSchedule));
         this.validateLeaf(merkleRoots[rootIndex], decodableArgs, proof);
 
         DistributionState memory distributionState = schedules[allocation.id];
@@ -3465,7 +3474,7 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
 
     /// @notice Sets the claim fee in wei
     function setClaimFee(uint256 _claimFee) external onlyRole(FEE_SETTER_ROLE) {
-        if (_claimFee > MAX_CLAIM_FEE) revert ClaimFeeExceedsMaximum();
+        if (_claimFee > maxClaimFee) revert ClaimFeeExceedsMaximum();
         if (feeCollector == address(0)) revert InvalidFeeCollector();
         claimFee = _claimFee;
     }
@@ -3573,13 +3582,13 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
         view
     {
         if (_isCalendar(decodableArgs)) {
-            (CalendarAllocation memory calendar, CalendarUnlockSchedule memory unlockSchedule) =
+            (, CalendarUnlockSchedule memory unlockSchedule) =
                 this.getCalendarLeafAllocationData(rootIndex, decodableArgs, proof);
             if (block.timestamp >= unlockSchedule.unlockTimestamps[unlockSchedule.unlockTimestamps.length - 1]) {
                 revert AlreadyFullyUnlocked();
             }
         } else {
-            (IntervalAllocation memory interval, IntervalUnlockSchedule memory intervalUnlockSchedule) =
+            (, IntervalUnlockSchedule memory intervalUnlockSchedule) =
                 this.getIntervalLeafAllocationData(rootIndex, decodableArgs, proof);
             uint32 finalUnlockTimestamp =
                 _getPieceEndTime(intervalUnlockSchedule.pieces[intervalUnlockSchedule.pieces.length - 1]);
@@ -3640,17 +3649,16 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
 
         uint256 withdrawableAmount = _getVestedAmount(
             unlockSchedule.unlockTimestamps,
-            unlockSchedule.unlockPercents,
+            unlockSchedule.unlockAmounts,
             calendar.allocation.totalAllocation,
             schedules[calendar.allocation.id].terminatedTimestamp
         ) - schedules[calendar.allocation.id].withdrawn;
 
         uint256 contractBalance = IERC20(token).balanceOf(address(this));
-
         _checkOrSetOriginalBeneficiary(calendar.allocation);
 
         withdrawableAmount = Math.min(withdrawableAmount, contractBalance);
-        _handleClaimFee();
+        _handleClaimFee(calendar.allocation.id);
         _withdrawToBeneficiary(
             calendar.allocation,
             schedules[calendar.allocation.id],
@@ -3690,7 +3698,7 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
         _checkOrSetOriginalBeneficiary(interval.allocation);
 
         withdrawableAmount = Math.min(withdrawableAmount, contractBalance);
-        _handleClaimFee();
+        _handleClaimFee(interval.allocation.id);
         _withdrawToBeneficiary(
             interval.allocation,
             schedules[interval.allocation.id],
@@ -3702,17 +3710,44 @@ contract MerkleVester is IAirlockBase, IMerkleVester, IntervalVester, CalendarVe
     }
 
     /**
-     * @notice Validates the fee parameters and transfers fee to fee collector
+     * @notice Returns the claim fee for an allocation id
+     *
+     * @param allocationId the allocation id
+     *
+     * @return the claim fee
      */
-    function _handleClaimFee() private {
-        if (msg.value != claimFee) revert InvalidFeeFundsSent();
+    function getClaimFee(string memory allocationId) external view returns (uint256) {
+        if (shouldPayClaimFeeOnlyOnce && feeAlreadyPayed[allocationId]) {
+            return 0;
+        } else {
+            return claimFee;
+        }
+    }
 
-        if (claimFee > 0) {
+    /**
+     * @notice Validates the fee parameters and transfers fee to fee collector
+     *
+     * @param allocationId the allocation id
+     */
+    function _handleClaimFee(string memory allocationId) private {
+        uint256 calculatedClaimFee;
+        if (shouldPayClaimFeeOnlyOnce) {
+            if (!feeAlreadyPayed[allocationId] && claimFee != 0) {
+                // if claimFee is 0, feeAlreadyPayed is not set to true
+                feeAlreadyPayed[allocationId] = true;
+                calculatedClaimFee = claimFee;
+            }
+        } else {
+            calculatedClaimFee = claimFee;
+        }
+
+        if (msg.value != calculatedClaimFee) revert InvalidFeeFundsSent();
+
+        if (calculatedClaimFee > 0) {
             if (feeCollector == address(0)) {
                 revert InvalidFeeCollector();
             }
-            SafeTransferLib.safeTransferETH(feeCollector, msg.value);
+            SafeTransferLib.safeTransferETH(feeCollector, calculatedClaimFee);
         }
     }
 }
-
